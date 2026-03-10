@@ -155,6 +155,10 @@ All tables are indexed on common query fields. The database uses WAL mode for co
 - Rate limit handling with automatic retry (60s backoff on 429)
 - Concurrent report detail fetching (semaphore-limited to 10)
 
+## Author
+
+**Patrik Fehrenbach** — [LinkedIn](https://www.linkedin.com/in/patrikfehrenbach/) · [X](https://x.com/itsecurityguard)
+
 ## License
 
 MIT
