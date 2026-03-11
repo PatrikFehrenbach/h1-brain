@@ -2,7 +2,9 @@
 
 An MCP server that connects your AI assistant to HackerOne. It pulls your bug bounty history, program scopes, and report details into a local SQLite database, then exposes tools that let any MCP-compatible client (Claude Desktop, Claude Code, etc.) search, analyze, and build on your past work.
 
-The primary tool, `hack(handle)`, generates a full hacking session briefing in a single call: fresh scope from the API, your past findings on that program, weakness patterns from your global track record, untouched assets, and suggested attack vectors — all formatted as actionable instructions for the AI.
+It also ships with a **pre-built database of 3,600+ publicly disclosed bounty-awarded reports** from the HackerOne community — full vulnerability write-ups, weakness types, and bounty amounts. The AI uses both your personal data and public knowledge to generate attack briefings.
+
+The primary tool, `hack(handle)`, generates a full hacking session briefing in a single call: fresh scope from the API, your past findings, public disclosures for that program, weakness patterns, untouched assets, and suggested attack vectors — all formatted as actionable instructions that put the AI in offensive mode.
 
 ## How It Works
 
@@ -16,13 +18,16 @@ For a full walkthrough, check out the three-part **[Bug Bounty Goldfish](https:/
 graph LR
     A["Claude Desktop / Code"] -->|MCP Protocol| B["h1-brain server"]
     B -->|API calls| C["HackerOne API"]
-    B -->|reads / writes| D["SQLite DB"]
+    B -->|reads / writes| D["Your Reports DB"]
+    B -->|reads| E["Public Reports DB"]
     C -->|reports, programs, scopes| B
-    D -->|search, analyze, hack| A
+    D -->|your history + analysis| A
+    E -->|community knowledge| A
     style A fill:#ff5c5c,stroke:#ff5c5c,color:#fff
     style B fill:#1a1d27,stroke:#ff5c5c,color:#fff
     style C fill:#1a1d27,stroke:#555,color:#fff
     style D fill:#1a1d27,stroke:#555,color:#fff
+    style E fill:#1a1d27,stroke:#555,color:#fff
 ```
 
 ```mermaid
@@ -31,8 +36,8 @@ flowchart TD
     B --> C["Pull your reports on this program from SQLite"]
     C --> D["Analyze weakness patterns across ALL programs"]
     D --> E["Identify untouched bounty-eligible assets"]
-    E --> F["Cross-reference: weaknesses that paid elsewhere but not here"]
-    F --> G["Generate structured briefing with agent instructions"]
+    E --> F["Cross-reference public disclosed reports for this program"]
+    F --> G["Generate attack briefing with agent instructions"]
     style A fill:#ff5c5c,stroke:#ff5c5c,color:#fff
     style G fill:#ff5c5c,stroke:#ff5c5c,color:#fff
     style B fill:#1a1d27,stroke:#555,color:#fff
@@ -50,12 +55,14 @@ flowchart TD
 ## Setup
 
 ```bash
-git clone https://github.com/user/h1-brain.git
+git clone https://github.com/PatrikFehrenbach/h1-brain.git
 cd h1-brain
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+The public disclosed reports database (`disclosed_reports.db`) is included in the repo — no extra setup needed.
 
 ## Connecting to Claude
 
@@ -89,31 +96,16 @@ claude mcp add h1-brain \
   -- /path/to/h1-brain/venv/bin/python /path/to/h1-brain/server.py
 ```
 
-Or add manually to `.claude/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "h1-brain": {
-      "command": "/path/to/h1-brain/venv/bin/python",
-      "args": ["/path/to/h1-brain/server.py"],
-      "env": {
-        "H1_USERNAME": "your_hackerone_username",
-        "H1_API_TOKEN": "your_api_token"
-      }
-    }
-  }
-}
-```
-
 ## First Run
 
-After connecting, populate your local database:
+After connecting, populate your personal database:
 
-1. **`fetch_rewarded_reports`** — Pulls all your bounty-awarded reports, including full vulnerability write-ups and attachment metadata. This is the most important step.
+1. **`fetch_rewarded_reports`** — Pulls all your bounty-awarded reports with full vulnerability write-ups. This is the most important step.
 2. **`fetch_programs`** — Pulls all programs you have access to.
 
 These only need to be run once. Re-run periodically to sync new reports.
+
+The public disclosed reports are ready to query immediately — no setup needed.
 
 ## Tools
 
@@ -122,76 +114,79 @@ These only need to be run once. Re-run periodically to sync new reports.
 The primary entry point. One call does everything:
 
 1. Fetches fresh program scopes from the HackerOne API
-2. Pulls your past rewarded reports for that program from the local database
+2. Pulls your past rewarded reports for that program
 3. Cross-references your full report history for weakness patterns
-4. Identifies untouched in-scope assets you haven't reported on yet
-5. Suggests attack vectors based on weaknesses that paid off on other programs but haven't been found here
-6. Returns a structured markdown briefing with embedded agent instructions
-
-The output is designed to double as agent instructions — the AI reads the briefing and immediately knows the scope, history, and where to focus.
+4. Identifies untouched bounty-eligible assets
+5. Pulls public disclosed reports for this program — what other researchers found and got paid for
+6. Suggests attack vectors based on weaknesses that paid elsewhere but haven't been found here
+7. Returns an attack briefing that puts the AI in offensive mode
 
 **Briefing structure:**
 
-- **Scope** — bounty-eligible and non-bounty assets with severity caps and instructions
-- **Your Past Findings** — rewarded reports on this program with severity, weakness type, and bounty amounts
-- **Weakness Types That Worked** — frequency of each weakness type you've been rewarded for here
+- **Scope** — bounty-eligible and non-bounty assets with severity caps
+- **Your Past Findings** — rewarded reports with severity, weakness type, and bounty amounts
+- **Weakness Types That Worked** — what's been rewarded here before
 - **Untouched Scope** — bounty-eligible assets with zero findings from you
-- **Suggested Attack Vectors** — weakness types rewarded on other programs but not yet found here, ranked by frequency
-- **Instructions** — directs the AI to assist within the defined scope
+- **Suggested Attack Vectors** — weaknesses rewarded on other programs but not yet found here
+- **Public Disclosed Reports** — what other researchers found on this program, weakness patterns from public disclosures
+- **Instructions** — puts the AI in attack mode with specific directives
 
-### Search Tools
+### Your Reports
 
-These query the local SQLite database. No API calls, instant results.
-
-| Tool | Description |
-|------|-------------|
-| `search_reports(query, program, weakness, severity, limit)` | Search reports by title, program handle, weakness type (e.g. `"SSRF"`, `"XSS"`), or severity rating (`critical`, `high`, `medium`, `low`). All filters are optional and combined with AND. Returns results sorted by bounty amount with vulnerability snippets. |
-| `search_programs(query, bounty_only, limit)` | Search programs by handle or name. Optionally filter to bounty-only programs. |
-| `search_scopes(program, asset, bounty_only, limit)` | Search assets across all stored programs. Filter by program handle, asset identifier, or bounty eligibility. |
-| `get_report(report_id)` | Full report details: metadata, severity, weakness, bounty, vulnerability write-up, and attachment list with IDs. |
-| `get_report_summary()` | Summary of all rewarded reports grouped by program with report counts and bounty totals. |
-
-### Attachment Tools
+These query your personal data (`h1_data.db`). No API calls, instant results.
 
 | Tool | Description |
 |------|-------------|
-| `fetch_attachment(report_id, attachment_id?)` | Fetches fresh download URLs for report attachments. URLs expire after ~1 hour. If `attachment_id` is omitted, returns URLs for all attachments on the report. |
+| `search_reports(query, program, weakness, severity, limit)` | Search your rewarded reports by title, program, weakness type, or severity |
+| `get_report(report_id)` | Full report details with vulnerability write-up and attachments |
+| `get_report_summary()` | Reports grouped by program with totals |
+| `search_programs(query, bounty_only, limit)` | Search your stored programs |
+| `search_scopes(program, asset, bounty_only, limit)` | Search in-scope assets across programs |
+| `fetch_attachment(report_id, attachment_id?)` | Fresh download URLs for report attachments (expire in ~1 hour) |
 
-Attachment metadata (file name, type, size) is stored locally during `fetch_rewarded_reports`. The actual files live on S3 with expiring URLs, so `fetch_attachment` hits the API each time to get a fresh link.
+### Public Disclosed Reports
 
-### Data Sync Tools
-
-These fetch data from the HackerOne API and store it locally.
+These query the pre-built database of 3,600+ bounty-awarded public disclosures (`disclosed_reports.db`).
 
 | Tool | Description |
 |------|-------------|
-| `fetch_rewarded_reports` | Pulls all bounty-awarded reports with full details, vulnerability write-ups, and attachment metadata. Fetches report details concurrently (10 at a time). |
-| `fetch_programs` | Pulls all accessible programs. |
-| `fetch_program_scopes(handle)` | Pulls structured scopes for a specific program. Called automatically by `hack()`. |
+| `search_disclosed_reports(query, program, weakness, limit)` | Full-text search across public reports — titles and vulnerability write-ups |
+| `get_disclosed_report(report_id)` | Full details of a public disclosed report |
+
+### Data Sync
+
+| Tool | Description |
+|------|-------------|
+| `fetch_rewarded_reports` | Sync your bounty-awarded reports from the API |
+| `fetch_programs` | Sync your accessible programs |
+| `fetch_program_scopes(handle)` | Sync scopes for a program (called automatically by `hack()`) |
 
 ## Architecture
 
 ```
-server.py          Single-file MCP server
-h1_data.db         SQLite database (auto-created on first run)
-requirements.txt   Python dependencies (mcp, httpx)
+server.py              MCP server
+hack_instructions.md   Attack briefing instructions (loaded by hack())
+h1_data.db             Your personal reports, programs, scopes (auto-created, gitignored)
+disclosed_reports.db   3,600+ public disclosed bounty reports (ships with repo)
+requirements.txt       Python dependencies (mcp, httpx)
 ```
 
-### Database Schema
+### Two Databases
 
-- **reports** — id, title, state, dates, program_handle, weakness (name + CWE), severity (rating + score), bounty (amount + currency), vulnerability_information, disclosed_at
-- **programs** — id, handle, name, submission_state, offers_bounties, currency
-- **scopes** — id, program_handle, asset_identifier, asset_type, bounty/submission eligibility, max_severity, instruction
-- **attachments** — id, report_id, file_name, content_type, file_size, created_at
+| Database | Contains | Source |
+|----------|----------|--------|
+| `h1_data.db` | Your personal reports, programs, scopes, attachments | HackerOne API (your account) |
+| `disclosed_reports.db` | Public disclosed reports that paid a bounty | Pre-built, ships with repo |
 
-All tables are indexed on common query fields. The database uses WAL mode for concurrent reads.
+The AI knows the difference. Your personal tools (`search_reports`, `get_report`) query your data. Public tools (`search_disclosed_reports`, `get_disclosed_report`) query community data. `hack()` uses both.
 
-### API Integration
+### Public Reports Database
 
-- Authenticates via HackerOne API v1 Basic Auth
-- Handles pagination automatically (100 items per page)
-- Rate limit handling with automatic retry (60s backoff on 429)
-- Concurrent report detail fetching (semaphore-limited to 10)
+The `disclosed_reports.db` contains publicly disclosed HackerOne reports that:
+- Paid a bounty
+- Have actual vulnerability write-ups (redacted/empty reports are excluded)
+
+Each report includes: title, vulnerability details, weakness type, program, asset, CVEs, and bounty amount (when available).
 
 ## Author
 

@@ -10,8 +10,10 @@ H1_USERNAME = os.environ["H1_USERNAME"]
 H1_API_TOKEN = os.environ["H1_API_TOKEN"]
 H1_BASE_URL = "https://api.hackerone.com/v1"
 
-DB_FILE = "h1_data.db"
-JSON_FILE = "h1_data.json"
+_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(_DIR, "h1_data.db")
+DISCLOSED_DB_FILE = os.path.join(_DIR, "disclosed_reports.db")
+JSON_FILE = os.path.join(_DIR, "h1_data.json")
 
 mcp = FastMCP("h1-brain")
 
@@ -78,6 +80,42 @@ def _init_db():
         CREATE INDEX IF NOT EXISTS idx_reports_severity ON reports(severity_rating);
         CREATE INDEX IF NOT EXISTS idx_scopes_program ON scopes(program_handle);
         CREATE INDEX IF NOT EXISTS idx_attachments_report ON attachments(report_id);
+
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _get_disclosed_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DISCLOSED_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _init_disclosed_db():
+    conn = _get_disclosed_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS disclosed_reports (
+            id INTEGER PRIMARY KEY,
+            title TEXT,
+            vulnerability_information TEXT,
+            weakness_name TEXT,
+            program_handle TEXT,
+            asset_identifier TEXT,
+            asset_type TEXT,
+            cve_ids TEXT,
+            bounty_amount REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_disclosed_program ON disclosed_reports(program_handle);
+        CREATE INDEX IF NOT EXISTS idx_disclosed_weakness ON disclosed_reports(weakness_name);
+    """)
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS disclosed_reports_fts USING fts5(
+            title, vulnerability_information,
+            content='disclosed_reports',
+            content_rowid='id'
+        )
     """)
     conn.commit()
     conn.close()
@@ -137,6 +175,7 @@ def _migrate_json():
 
 # Initialize on import
 _init_db()
+_init_disclosed_db()
 _migrate_json()
 
 
@@ -226,7 +265,7 @@ def _extract_weakness(report: dict) -> tuple[str | None, str | None]:
 
 @mcp.tool()
 async def fetch_rewarded_reports() -> str:
-    """Fetch all your HackerOne reports that received a bounty and store them in the database."""
+    """Sync your personal bounty-awarded reports from HackerOne API into the local database. Run once, re-run to update."""
     all_reports = await _fetch_all_pages("/hackers/me/reports")
 
     rewarded_basic = [r for r in all_reports if r.get("attributes", {}).get("bounty_awarded_at")]
@@ -283,7 +322,7 @@ async def fetch_rewarded_reports() -> str:
 
 @mcp.tool()
 async def fetch_programs() -> str:
-    """Fetch all HackerOne programs you have access to and store them in the database."""
+    """Sync your accessible HackerOne programs into the local database."""
     all_programs = await _fetch_all_pages("/hackers/programs")
 
     rows = []
@@ -306,7 +345,7 @@ async def fetch_programs() -> str:
 
 @mcp.tool()
 async def fetch_program_scopes(handle: str) -> str:
-    """Fetch structured scopes for a specific program and store them in the database.
+    """Fetch scopes for a program from the API. Called automatically by hack().
 
     Args:
         handle: The program handle
@@ -342,14 +381,14 @@ async def search_reports(
     severity: str = "",
     limit: int = 20,
 ) -> str:
-    """Search your rewarded reports. All filters are optional and combined with AND.
+    """Search your personal rewarded reports. For public community reports use search_disclosed_reports.
 
     Args:
-        query: Search in report titles (fuzzy match)
-        program: Filter by program handle (exact or partial match)
-        weakness: Filter by weakness type (partial match, e.g. 'XSS', 'SSRF', 'SQL')
-        severity: Filter by severity rating (critical, high, medium, low)
-        limit: Max results to return (default 20)
+        query: Title search (partial match)
+        program: Program handle filter
+        weakness: Weakness type filter (e.g. 'XSS', 'SSRF')
+        severity: Severity rating (critical, high, medium, low)
+        limit: Max results (default 20)
     """
     conn = _get_db()
     conditions = []
@@ -403,10 +442,10 @@ async def search_reports(
 
 @mcp.tool()
 async def get_report(report_id: str) -> str:
-    """Get full details of a specific report including the vulnerability write-up.
+    """Get full details of your personal report. For public reports use get_disclosed_report.
 
     Args:
-        report_id: The report ID number (e.g. '19264')
+        report_id: The report ID
     """
     conn = _get_db()
     row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
@@ -452,11 +491,11 @@ async def get_report(report_id: str) -> str:
 
 @mcp.tool()
 async def fetch_attachment(report_id: str, attachment_id: str = "") -> str:
-    """Fetch fresh download URLs for report attachments. URLs expire after ~1 hour.
+    """Get fresh download URLs for report attachments (expire in ~1 hour).
 
     Args:
-        report_id: The report ID number
-        attachment_id: Optional specific attachment ID. If empty, returns all attachments for the report.
+        report_id: The report ID
+        attachment_id: Specific attachment ID, or empty for all
     """
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await _api_get(client, f"/hackers/reports/{report_id}")
@@ -485,11 +524,11 @@ async def fetch_attachment(report_id: str, attachment_id: str = "") -> str:
 
 @mcp.tool()
 async def search_programs(query: str = "", bounty_only: bool = False, limit: int = 20) -> str:
-    """Search stored programs.
+    """Search your stored programs by handle or name.
 
     Args:
-        query: Search in program handle or name (partial match)
-        bounty_only: Only show programs that offer bounties
+        query: Program handle or name (partial match)
+        bounty_only: Only bounty programs
         limit: Max results (default 20)
     """
     conn = _get_db()
@@ -529,11 +568,11 @@ async def search_scopes(
     bounty_only: bool = False,
     limit: int = 30,
 ) -> str:
-    """Search stored scopes/assets across programs.
+    """Search in-scope assets across programs.
 
     Args:
-        program: Filter by program handle (exact or partial)
-        asset: Search in asset identifier (partial match)
+        program: Program handle filter
+        asset: Asset identifier (partial match)
         bounty_only: Only bounty-eligible assets
         limit: Max results (default 30)
     """
@@ -572,7 +611,7 @@ async def search_scopes(
 
 @mcp.tool()
 async def get_report_summary() -> str:
-    """Get a summary of rewarded reports grouped by program with totals."""
+    """Summary of your rewarded reports grouped by program with totals."""
     conn = _get_db()
     rows = conn.execute("""
         SELECT program_handle, COUNT(*) as cnt, SUM(bounty_amount) as total
@@ -595,12 +634,128 @@ async def get_report_summary() -> str:
     return "\n".join(lines)
 
 
+# --- Disclosed reports tools ---
+
+@mcp.tool()
+async def search_disclosed_reports(
+    query: str = "",
+    program: str = "",
+    weakness: str = "",
+    limit: int = 20,
+) -> str:
+    """Search public disclosed reports from other researchers that paid a bounty. For your own reports use search_reports.
+
+    Args:
+        query: Full-text search in title and vulnerability write-up
+        program: Program handle filter
+        weakness: Weakness type filter (e.g. 'XSS', 'SSRF')
+        limit: Max results (default 20)
+    """
+    conn = _get_disclosed_db()
+
+    if query:
+        # FTS5 search, optionally filtered
+        conditions = []
+        params = []
+
+        if program:
+            conditions.append("d.program_handle LIKE ?")
+            params.append(f"%{program}%")
+        if weakness:
+            conditions.append("d.weakness_name LIKE ?")
+            params.append(f"%{weakness}%")
+
+        where_extra = (" AND " + " AND ".join(conditions)) if conditions else ""
+        params = [query] + params + [limit]
+
+        rows = conn.execute(f"""
+            SELECT d.*, rank FROM disclosed_reports_fts fts
+            JOIN disclosed_reports d ON d.id = fts.rowid
+            WHERE disclosed_reports_fts MATCH ?{where_extra}
+            ORDER BY d.id DESC
+            LIMIT ?
+        """, params).fetchall()
+    else:
+        conditions = []
+        params = []
+        if program:
+            conditions.append("program_handle LIKE ?")
+            params.append(f"%{program}%")
+        if weakness:
+            conditions.append("weakness_name LIKE ?")
+            params.append(f"%{weakness}%")
+
+        where = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        rows = conn.execute(
+            f"SELECT * FROM disclosed_reports WHERE {where} ORDER BY id DESC LIMIT ?",
+            params,
+        ).fetchall()
+
+    conn.close()
+
+    if not rows:
+        return "No disclosed reports found matching your search."
+
+    lines = [f"Found {len(rows)} disclosed reports:", ""]
+    for r in rows:
+        weak = r["weakness_name"] or "unknown"
+        asset = r["asset_identifier"] or ""
+        cves = json.loads(r["cve_ids"] or "[]")
+        cve_str = f" [{', '.join(cves)}]" if cves else ""
+        bounty_str = f" — ${r['bounty_amount']:,.0f}" if r["bounty_amount"] else ""
+        lines.append(f"- **#{r['id']}** {r['title']} — {r['program_handle']} — {weak}{cve_str}{bounty_str}")
+        if asset:
+            lines.append(f"  Asset: `{asset}` ({r['asset_type']})")
+        vuln = r["vulnerability_information"]
+        if vuln:
+            snippet = vuln[:200].replace("\n", " ").strip()
+            if len(vuln) > 200:
+                snippet += "..."
+            lines.append(f"  > {snippet}")
+
+    lines.append("")
+    lines.append("_Use get_disclosed_report(id) for full details._")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_disclosed_report(report_id: int) -> str:
+    """Get full details of a public disclosed report. For your own reports use get_report.
+
+    Args:
+        report_id: The report ID
+    """
+    conn = _get_disclosed_db()
+    row = conn.execute("SELECT * FROM disclosed_reports WHERE id = ?", (report_id,)).fetchone()
+    conn.close()
+
+    if not row:
+        return f"Disclosed report #{report_id} not found in database."
+
+    r = dict(row)
+    cves = json.loads(r["cve_ids"] or "[]")
+    lines = [
+        f"# Disclosed Report #{r['id']}: {r['title']}",
+        "",
+        f"**Program:** {r['program_handle']}",
+        f"**Weakness:** {r['weakness_name'] or 'unknown'}",
+        f"**Bounty:** ${r['bounty_amount']:,.0f}" if r["bounty_amount"] else "**Bounty:** undisclosed",
+        f"**Asset:** `{r['asset_identifier']}` ({r['asset_type']})" if r["asset_identifier"] else "",
+        f"**CVEs:** {', '.join(cves)}" if cves else "",
+        "",
+        "## Vulnerability Details",
+        r["vulnerability_information"] or "_No details available._",
+    ]
+    return "\n".join(line for line in lines if line is not None)
+
+
 # --- Hack tool ---
 
 @mcp.tool()
 async def hack(handle: str) -> str:
-    """Start a hacking session for a HackerOne program. Fetches fresh scope from the API,
-    cross-references your past reports, and returns a full briefing with attack suggestions.
+    """Start a hacking session. Fetches fresh scope, cross-references your reports and public disclosures, returns an actionable attack briefing.
 
     Args:
         handle: The program handle
@@ -689,7 +844,35 @@ async def hack(handle: str) -> str:
             progs_str = ", ".join(programs[:5])
             suggestions.append(f"- {name} (rewarded {len(programs)}x on: {progs_str})")
 
-    # 9. Build briefing
+    # 9. Cross-reference disclosed reports for this program
+    disclosed_lines = []
+    disclosed_weakness_counts: dict[str, int] = {}
+    conn2 = _get_disclosed_db()
+    disclosed_count = conn2.execute(
+        "SELECT COUNT(*) FROM disclosed_reports WHERE program_handle = ?", (handle,)
+    ).fetchone()[0]
+    if disclosed_count:
+        disclosed_rows = conn2.execute(
+            "SELECT id, title, weakness_name, asset_identifier FROM disclosed_reports WHERE program_handle = ? ORDER BY id DESC LIMIT 20",
+            (handle,),
+        ).fetchall()
+        for dr in disclosed_rows:
+            weak = dr["weakness_name"] or "unknown"
+            asset = dr["asset_identifier"] or ""
+            asset_str = f" on `{asset}`" if asset else ""
+            disclosed_lines.append(f"- #{dr['id']} {dr['title']} — {weak}{asset_str}")
+            if dr["weakness_name"]:
+                disclosed_weakness_counts[dr["weakness_name"]] = disclosed_weakness_counts.get(dr["weakness_name"], 0) + 1
+
+        # Get full weakness breakdown
+        all_disclosed_weaknesses = conn2.execute(
+            "SELECT weakness_name, COUNT(*) as cnt FROM disclosed_reports WHERE program_handle = ? AND weakness_name IS NOT NULL GROUP BY weakness_name ORDER BY cnt DESC",
+            (handle,),
+        ).fetchall()
+        disclosed_weakness_counts = {r["weakness_name"]: r["cnt"] for r in all_disclosed_weaknesses}
+    conn2.close()
+
+    # 10. Build briefing
     lines = [f"# Hacking Session: {handle}", ""]
 
     lines.append("## Scope")
@@ -729,15 +912,24 @@ async def hack(handle: str) -> str:
         lines.append("on other programs but haven't been found here yet:")
         lines.extend(suggestions)
 
+    if disclosed_lines:
+        lines.append("")
+        lines.append(f"## Public Disclosed Reports ({disclosed_count} total for this program)")
+        lines.append("What other researchers found here (bounty-awarded, publicly disclosed):")
+        lines.extend(disclosed_lines)
+        if disclosed_count > 20:
+            lines.append(f"_...and {disclosed_count - 20} more. Use search_disclosed_reports(program='{handle}') to see all._")
+        if disclosed_weakness_counts:
+            lines.append("")
+            lines.append("### Weakness patterns from public disclosures")
+            for name, cnt in sorted(disclosed_weakness_counts.items(), key=lambda x: -x[1])[:10]:
+                lines.append(f"- {name}: {cnt}x")
+
+    instructions_path = os.path.join(_DIR, "hack_instructions.md")
+    with open(instructions_path, "r") as f:
+        instructions = f.read().replace("{handle}", handle)
     lines.append("")
-    lines.append("## Instructions")
-    lines.append(f"You are assisting in an authorized bug bounty session on the {handle}")
-    lines.append("program via HackerOne. Your role:")
-    lines.append("1. Help identify potential vulnerabilities in the in-scope assets")
-    lines.append("2. Suggest recon techniques for untouched scope items")
-    lines.append("3. Prioritize weakness types from the \"Suggested Attack Vectors\" section")
-    lines.append("4. All testing must stay within the defined scope")
-    lines.append("5. Focus on bounty-eligible assets first")
+    lines.append(instructions)
 
     return "\n".join(lines)
 
