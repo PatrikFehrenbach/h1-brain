@@ -52,7 +52,7 @@ flowchart TD
 ## Requirements
 
 - Python 3.10+
-- A HackerOne API token ([generate one here](https://hackerone.com/settings/api_token))
+- A HackerOne API token ([generate one here](https://hackerone.com/settings/api_token/edit))
 
 ## Setup
 
