@@ -59,6 +59,8 @@ flowchart TD
 ```bash
 git clone https://github.com/PatrikFehrenbach/h1-brain.git
 cd h1-brain
+git lfs install
+git lfs pull
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
