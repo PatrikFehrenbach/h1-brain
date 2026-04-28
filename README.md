@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/patrikfehrenbach-h1-brain-badge.png)](https://mseep.ai/app/patrikfehrenbach-h1-brain)
+
 # h1-brain
 
 An MCP server that connects your AI assistant to HackerOne. It pulls your bug bounty history, program scopes, and report details into a local SQLite database, then exposes tools that let any MCP-compatible client (Claude Desktop, Claude Code, etc.) search, analyze, and build on your past work.
