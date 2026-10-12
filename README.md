@@ -107,6 +107,8 @@ After connecting, populate your personal database:
 
 These only need to be run once. Re-run periodically to sync new reports.
 
+To pull your **full** history on a specific program — including non-rewarded reports (`informative`, `triaged`, `duplicate`, `new`, etc.) and every comment/activity thread — use **`fetch_program_reports(handle)`**. Pass an `out_dir` to also export each report as a markdown file.
+
 The public disclosed reports are ready to query immediately — no setup needed.
 
 ## Tools
@@ -141,6 +143,7 @@ These query your personal data (`h1_data.db`). No API calls, instant results.
 |------|-------------|
 | `search_reports(query, program, weakness, severity, limit)` | Search your rewarded reports by title, program, weakness type, or severity |
 | `get_report(report_id)` | Full report details with vulnerability write-up and attachments |
+| `get_report_thread(report_id)` | Full comment/activity timeline (oldest→newest) for a report, as stored by `fetch_program_reports` |
 | `get_report_summary()` | Reports grouped by program with totals |
 | `search_programs(query, bounty_only, limit)` | Search your stored programs |
 | `search_scopes(program, asset, bounty_only, limit)` | Search in-scope assets across programs |
@@ -160,6 +163,7 @@ These query the pre-built database of 3,600+ bounty-awarded public disclosures (
 | Tool | Description |
 |------|-------------|
 | `fetch_rewarded_reports` | Sync your bounty-awarded reports from the API |
+| `fetch_program_reports(handle, out_dir?, include_internal?)` | Sync **all** your reports for a program — every state, not just rewarded — each with its full comment/activity timeline. Optionally export one markdown file per report (plus `raw/<id>.json` and `index.md`) to `out_dir`. |
 | `fetch_programs` | Sync your accessible programs |
 | `fetch_program_scopes(handle)` | Sync scopes for a program (called automatically by `hack()`) |
 
@@ -168,7 +172,7 @@ These query the pre-built database of 3,600+ bounty-awarded public disclosures (
 ```
 server.py              MCP server
 hack_instructions.md   Attack briefing instructions (loaded by hack())
-h1_data.db             Your personal reports, programs, scopes (auto-created, gitignored)
+h1_data.db             Your personal reports, programs, scopes, activity timelines (auto-created, gitignored)
 disclosed_reports.db   3,600+ public disclosed bounty reports (ships with repo)
 requirements.txt       Python dependencies (mcp, httpx)
 ```
@@ -177,7 +181,7 @@ requirements.txt       Python dependencies (mcp, httpx)
 
 | Database | Contains | Source |
 |----------|----------|--------|
-| `h1_data.db` | Your personal reports, programs, scopes, attachments | HackerOne API (your account) |
+| `h1_data.db` | Your personal reports, programs, scopes, attachments, activity timelines | HackerOne API (your account) |
 | `disclosed_reports.db` | Public disclosed reports that paid a bounty | Pre-built, ships with repo |
 
 The AI knows the difference. Your personal tools (`search_reports`, `get_report`) query your data. Public tools (`search_disclosed_reports`, `get_disclosed_report`) query community data. `hack()` uses both.
