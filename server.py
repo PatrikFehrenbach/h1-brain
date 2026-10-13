@@ -80,6 +80,16 @@ def _init_db():
         CREATE INDEX IF NOT EXISTS idx_reports_severity ON reports(severity_rating);
         CREATE INDEX IF NOT EXISTS idx_scopes_program ON scopes(program_handle);
         CREATE INDEX IF NOT EXISTS idx_attachments_report ON attachments(report_id);
+        CREATE TABLE IF NOT EXISTS activities (
+            id TEXT PRIMARY KEY,
+            report_id TEXT,
+            type TEXT,
+            message TEXT,
+            internal INTEGER,
+            actor TEXT,
+            created_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_activities_report ON activities(report_id);
 
     """)
     conn.commit()
@@ -259,6 +269,81 @@ def _extract_weakness(report: dict) -> tuple[str | None, str | None]:
         return None, None
     attrs = weak_data.get("attributes", {})
     return attrs.get("name"), attrs.get("external_id")
+
+
+def _slug(text, maxlen=60):
+    out = []
+    for ch in (text or "").lower():
+        out.append(ch if ch.isalnum() else "-")
+    s = "".join(out)
+    while "--" in s:
+        s = s.replace("--", "-")
+    s = s.strip("-")
+    return s[:maxlen].strip("-") or "untitled"
+
+
+def _extract_activities(detail: dict) -> list:
+    acts = detail.get("relationships", {}).get("activities", {}).get("data", []) or []
+    out = []
+    for a in acts:
+        attrs = a.get("attributes", {}) or {}
+        actor = (a.get("relationships", {}).get("actor", {}) or {}).get("data", {}) or {}
+        actor_name = (actor.get("attributes", {}) or {}).get("username") or actor.get("type") or "unknown"
+        out.append({
+            "id": a.get("id"),
+            "type": a.get("type"),
+            "message": attrs.get("message"),
+            "internal": bool(attrs.get("internal")),
+            "actor": actor_name,
+            "created_at": attrs.get("created_at"),
+        })
+    out.sort(key=lambda x: x.get("created_at") or "")
+    return out
+
+
+def _report_markdown(item: dict, detail: dict, activities: list, include_internal: bool = True) -> str:
+    attrs = item.get("attributes", {})
+    dattrs = detail.get("attributes", {})
+    rid = item.get("id")
+    title = attrs.get("title") or "(no title)"
+    sev_rating, sev_score = _extract_severity(detail)
+    weak_name, weak_cwe = _extract_weakness(item)
+    bounty_amount, bounty_currency = _extract_bounty(detail)
+    L = [f"# [{rid}] {title}", ""]
+    L.append(f"- **State:** {attrs.get('state')}")
+    L.append(f"- **Created:** {attrs.get('created_at')}")
+    if dattrs.get("triaged_at"):
+        L.append(f"- **Triaged:** {dattrs.get('triaged_at')}")
+    if attrs.get("closed_at"):
+        L.append(f"- **Closed:** {attrs.get('closed_at')}")
+    if dattrs.get("disclosed_at"):
+        L.append(f"- **Disclosed:** {dattrs.get('disclosed_at')}")
+    if sev_rating:
+        L.append(f"- **Severity:** {sev_rating} ({sev_score})")
+    if weak_name:
+        L.append(f"- **Weakness:** {weak_name} ({weak_cwe})")
+    if bounty_amount:
+        L.append(f"- **Bounty:** ${bounty_amount:,.0f} {bounty_currency}")
+    L.append(f"- **URL:** https://hackerone.com/reports/{rid}")
+    L.append("")
+    L.append("## Original report")
+    L.append("")
+    L.append(dattrs.get("vulnerability_information") or "(no body)")
+    L.append("")
+    shown = [a for a in activities if include_internal or not a["internal"]]
+    L.append(f"## Activity timeline ({len(shown)} events)")
+    L.append("")
+    if not shown:
+        L.append("_No activities._")
+    for a in shown:
+        tag = " [INTERNAL]" if a["internal"] else ""
+        kind = (a["type"] or "").replace("activity-", "")
+        L.append(f"### {a['created_at']} - {kind} - {a['actor']}{tag}")
+        if a["message"]:
+            L.append("")
+            L.append(a["message"])
+        L.append("")
+    return "\n".join(L)
 
 
 # --- Fetch tools (API -> DB) ---
@@ -932,6 +1017,132 @@ async def hack(handle: str) -> str:
     lines.append(instructions)
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def fetch_program_reports(handle: str, out_dir: str = "", include_internal: bool = True) -> str:
+    """Fetch ALL your reports for a program (EVERY state, not just rewarded) with their full
+    comment/activity timeline. Stores them in the local DB and, if out_dir is given, writes one
+    markdown file per report (full thread, oldest->newest) plus raw/<id>.json and index.md.
+
+    Args:
+        handle: Program handle (e.g. 'alloy')
+        out_dir: Absolute path of a folder to write report files into (optional)
+        include_internal: Include internal (non-public) activity messages (default True)
+    """
+    listed = await _fetch_all_pages("/hackers/me/reports", {"filter[program][]": handle})
+    filtered = [r for r in listed if (_extract_program_handle(r) or "").lower() == handle.lower()]
+    reports = filtered if filtered else listed
+    if not reports:
+        return f"No reports found for program '{handle}'."
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        sem = asyncio.Semaphore(8)
+
+        async def fetch_one(r):
+            async with sem:
+                resp = await _api_get(client, f"/hackers/reports/{r['id']}")
+                return r, resp.json().get("data", {})
+
+        pairs = list(await asyncio.gather(*[fetch_one(r) for r in reports]))
+
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(os.path.join(out_dir, "raw"), exist_ok=True)
+
+    conn = _get_db()
+    report_rows = []
+    state_counts = {}
+    dumped = 0
+    index_lines = [f"# HackerOne reports - program: {handle}", ""]
+
+    for r, detail in pairs:
+        attrs = r.get("attributes", {})
+        dattrs = detail.get("attributes", {})
+        sev_rating, sev_score = _extract_severity(detail)
+        weak_name, weak_cwe = _extract_weakness(r)
+        bounty_amount, bounty_currency = _extract_bounty(detail)
+        state = attrs.get("state")
+        state_counts[state] = state_counts.get(state, 0) + 1
+        report_rows.append((
+            r["id"], attrs.get("title"), state, attrs.get("created_at"),
+            attrs.get("bounty_awarded_at"), attrs.get("closed_at"),
+            _extract_program_handle(r) or handle, weak_name, weak_cwe,
+            sev_rating, sev_score, bounty_amount, bounty_currency,
+            dattrs.get("vulnerability_information"), dattrs.get("disclosed_at"),
+        ))
+        activities = _extract_activities(detail)
+        conn.execute("DELETE FROM activities WHERE report_id = ?", (r["id"],))
+        conn.executemany(
+            "INSERT OR REPLACE INTO activities VALUES (?,?,?,?,?,?,?)",
+            [(a["id"], r["id"], a["type"], a["message"],
+              1 if a["internal"] else 0, a["actor"], a["created_at"]) for a in activities],
+        )
+        if out_dir:
+            md = _report_markdown(r, detail, activities, include_internal)
+            fname = f"{r['id']}-{_slug(attrs.get('title'))}.md"
+            with open(os.path.join(out_dir, fname), "w") as f:
+                f.write(md)
+            with open(os.path.join(out_dir, "raw", f"{r['id']}.json"), "w") as f:
+                json.dump(detail, f, indent=2)
+            index_lines.append(f"- [{r['id']}]({fname}) - {state} - {attrs.get('title')}")
+            dumped += 1
+
+    conn.executemany(
+        "INSERT OR REPLACE INTO reports VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", report_rows
+    )
+    conn.commit()
+    conn.close()
+
+    if out_dir:
+        index_lines.insert(2, f"Total: {len(report_rows)}")
+        index_lines.insert(3, "")
+        with open(os.path.join(out_dir, "index.md"), "w") as f:
+            f.write("\n".join(index_lines) + "\n")
+
+    states_str = ", ".join(f"{k}: {v}" for k, v in sorted(state_counts.items()))
+    msg = f"Fetched {len(report_rows)} '{handle}' reports (all states) with activity timelines. States: {states_str}."
+    if out_dir:
+        msg += f" Wrote {dumped} markdown files + raw JSON + index.md to {out_dir}."
+    else:
+        msg += " Use get_report_thread(id) to read a full thread, or pass out_dir to dump files."
+    return msg
+
+
+@mcp.tool()
+async def get_report_thread(report_id: str) -> str:
+    """Read the full comment/activity timeline (oldest->newest) for one of your reports,
+    as stored by fetch_program_reports.
+
+    Args:
+        report_id: The report ID
+    """
+    conn = _get_db()
+    rep = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+    acts = conn.execute(
+        "SELECT * FROM activities WHERE report_id = ? ORDER BY created_at ASC", (report_id,)
+    ).fetchall()
+    conn.close()
+    if not rep:
+        return f"Report #{report_id} not in DB. Run fetch_program_reports(handle) first."
+    r = dict(rep)
+    L = [f"# Report #{r['id']}: {r['title']}", "",
+         f"**State:** {r['state']}  |  **Program:** {r['program_handle']}", ""]
+    L.append("## Original report")
+    L.append(r["vulnerability_information"] or "_No body stored._")
+    L.append("")
+    L.append(f"## Activity timeline ({len(acts)} events)")
+    if not acts:
+        L.append("_No activities stored for this report._")
+    for a in acts:
+        tag = " [INTERNAL]" if a["internal"] else ""
+        kind = (a["type"] or "").replace("activity-", "")
+        L.append("")
+        L.append(f"### {a['created_at']} - {kind} - {a['actor']}{tag}")
+        if a["message"]:
+            L.append("")
+            L.append(a["message"])
+    return "\n".join(L)
 
 
 if __name__ == "__main__":
