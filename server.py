@@ -54,7 +54,8 @@ def _init_db():
             name TEXT,
             submission_state TEXT,
             offers_bounties INTEGER,
-            currency TEXT
+            currency TEXT,
+            visibility TEXT
         );
         CREATE TABLE IF NOT EXISTS scopes (
             id TEXT PRIMARY KEY,
@@ -92,8 +93,19 @@ def _init_db():
         CREATE INDEX IF NOT EXISTS idx_activities_report ON activities(report_id);
 
     """)
+    # Migration: databases created before the visibility column existed
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(programs)")}
+    if "visibility" not in cols:
+        conn.execute("ALTER TABLE programs ADD COLUMN visibility TEXT")
     conn.commit()
     conn.close()
+
+
+def _program_visibility(state: str | None) -> str | None:
+    """Map HackerOne program `state` to 'public' (public_mode) or 'private' (soft_launched, etc.)."""
+    if not state:
+        return None
+    return "public" if state == "public_mode" else "private"
 
 
 def _get_disclosed_db() -> sqlite3.Connection:
@@ -161,7 +173,8 @@ def _migrate_json():
     programs = data.get("programs", [])
     for p in programs:
         conn.execute(
-            "INSERT OR REPLACE INTO programs VALUES (?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO programs (id, handle, name, submission_state, offers_bounties, currency)"
+            " VALUES (?,?,?,?,?,?)",
             (p.get("id"), p.get("handle"), p.get("name"),
              p.get("submission_state"), 1 if p.get("offers_bounties") else 0,
              p.get("currency")),
@@ -416,16 +429,21 @@ async def fetch_programs() -> str:
         rows.append((
             prog["id"], attrs.get("handle"), attrs.get("name"),
             attrs.get("submission_state"), 1 if attrs.get("offers_bounties") else 0,
-            attrs.get("currency"),
+            attrs.get("currency"), _program_visibility(attrs.get("state")),
         ))
 
     conn = _get_db()
     conn.execute("DELETE FROM programs")
-    conn.executemany("INSERT INTO programs VALUES (?,?,?,?,?,?)", rows)
+    conn.executemany(
+        "INSERT INTO programs (id, handle, name, submission_state, offers_bounties, currency, visibility)"
+        " VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
     conn.commit()
     conn.close()
 
-    return f"Fetched and stored {len(rows)} programs."
+    private = sum(1 for r in rows if r[6] == "private")
+    return f"Fetched and stored {len(rows)} programs ({len(rows) - private} public, {private} private)."
 
 
 @mcp.tool()
@@ -608,12 +626,13 @@ async def fetch_attachment(report_id: str, attachment_id: str = "") -> str:
 
 
 @mcp.tool()
-async def search_programs(query: str = "", bounty_only: bool = False, limit: int = 20) -> str:
+async def search_programs(query: str = "", bounty_only: bool = False, visibility: str = "", limit: int = 20) -> str:
     """Search your stored programs by handle or name.
 
     Args:
         query: Program handle or name (partial match)
         bounty_only: Only bounty programs
+        visibility: "public", "private", or "" for both (re-run fetch_programs once to populate)
         limit: Max results (default 20)
     """
     conn = _get_db()
@@ -623,6 +642,12 @@ async def search_programs(query: str = "", bounty_only: bool = False, limit: int
     if query:
         conditions.append("(handle LIKE ? OR name LIKE ?)")
         params.extend([f"%{query}%", f"%{query}%"])
+    if visibility:
+        if visibility not in ("public", "private"):
+            conn.close()
+            return "visibility must be 'public', 'private', or empty."
+        conditions.append("visibility = ?")
+        params.append(visibility)
     if bounty_only:
         conditions.append("offers_bounties = 1")
 
@@ -641,7 +666,8 @@ async def search_programs(query: str = "", bounty_only: bool = False, limit: int
     lines = [f"Found {len(rows)} programs:", ""]
     for p in rows:
         bounty_tag = " [bounty]" if p["offers_bounties"] else ""
-        lines.append(f"- {p['handle']} — {p['name']}{bounty_tag} ({p['submission_state']})")
+        vis_tag = f" [{p['visibility']}]" if p["visibility"] else ""
+        lines.append(f"- {p['handle']} — {p['name']}{vis_tag}{bounty_tag} ({p['submission_state']})")
 
     return "\n".join(lines)
 
