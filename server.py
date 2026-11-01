@@ -574,32 +574,58 @@ async def get_report(report_id: str) -> str:
     return "\n".join(line for line in lines if line is not None)
 
 
+def _collect_attachments(detail: dict) -> list:
+    """All attachments on a report: the original submission plus every
+    comment/activity attachment (inline {F...} images, triager uploads, etc.).
+
+    Returns a list of {"source", "actor", "att"} where "att" is the raw
+    attachment object from the API (its attributes include expiring_url).
+    """
+    out = []
+    for a in detail.get("relationships", {}).get("attachments", {}).get("data", []) or []:
+        out.append({"source": "report", "actor": None, "att": a})
+    for act in detail.get("relationships", {}).get("activities", {}).get("data", []) or []:
+        actor = (act.get("relationships", {}).get("actor", {}) or {}).get("data", {}) or {}
+        actor_name = (actor.get("attributes", {}) or {}).get("username") or act.get("type") or "unknown"
+        for a in act.get("relationships", {}).get("attachments", {}).get("data", []) or []:
+            out.append({"source": act.get("type"), "actor": actor_name, "att": a})
+    return out
+
+
 @mcp.tool()
 async def fetch_attachment(report_id: str, attachment_id: str = "") -> str:
     """Get fresh download URLs for report attachments (expire in ~1 hour).
 
+    Covers both the original report attachments AND attachments posted in
+    comments/activities (e.g. inline {F...} images and triager screenshots),
+    which were previously invisible to this tool.
+
     Args:
         report_id: The report ID
-        attachment_id: Specific attachment ID, or empty for all
+        attachment_id: Specific attachment ID (with or without a leading 'F'), or empty for all
     """
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await _api_get(client, f"/hackers/reports/{report_id}")
     detail = resp.json().get("data", {})
-    att_data = detail.get("relationships", {}).get("attachments", {}).get("data", [])
+    items = _collect_attachments(detail)
 
-    if not att_data:
+    if not items:
         return f"No attachments found for report #{report_id}."
 
     if attachment_id:
-        att_data = [a for a in att_data if a["id"] == attachment_id]
-        if not att_data:
+        wanted = attachment_id.lstrip("F")
+        items = [i for i in items if i["att"].get("id") == wanted]
+        if not items:
             return f"Attachment {attachment_id} not found on report #{report_id}."
 
     lines = [f"## Attachments for Report #{report_id}", ""]
-    for a in att_data:
+    for i in items:
+        a = i["att"]
         attrs = a.get("attributes", {})
         size_kb = (attrs.get("file_size") or 0) / 1024
-        lines.append(f"### {attrs.get('file_name')} ({attrs.get('content_type')}, {size_kb:.0f} KB)")
+        origin = "report" if i["source"] == "report" else f"{i['source']} by {i['actor']}"
+        lines.append(f"### F{a.get('id')} - {attrs.get('file_name')} ({attrs.get('content_type')}, {size_kb:.0f} KB)")
+        lines.append(f"- Source: {origin}")
         lines.append(f"**Download URL** (expires in ~1 hour):")
         lines.append(attrs.get("expiring_url", "N/A"))
         lines.append("")
