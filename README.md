@@ -103,7 +103,7 @@ claude mcp add h1-brain \
 After connecting, populate your personal database:
 
 1. **`fetch_rewarded_reports`** — Pulls all your bounty-awarded reports with full vulnerability write-ups. This is the most important step.
-2. **`fetch_programs`** — Pulls all programs you have access to.
+2. **`fetch_programs`** — Pulls all programs you have access to, both public and private (the result reports the split).
 
 These only need to be run once. Re-run periodically to sync new reports.
 
@@ -145,7 +145,7 @@ These query your personal data (`h1_data.db`). No API calls, instant results.
 | `get_report(report_id)` | Full report details with vulnerability write-up and attachments |
 | `get_report_thread(report_id)` | Full comment/activity timeline (oldest→newest) for a report, as stored by `fetch_program_reports` |
 | `get_report_summary()` | Reports grouped by program with totals |
-| `search_programs(query, bounty_only, limit)` | Search your stored programs |
+| `search_programs(query, bounty_only, visibility, limit)` | Search your stored programs; each result is tagged `[public]` or `[private]`. Set `visibility` to `"private"` or `"public"` to filter. |
 | `search_scopes(program, asset, bounty_only, limit)` | Search in-scope assets across programs |
 | `fetch_attachment(report_id, attachment_id?)` | Fresh download URLs for report attachments (expire in ~1 hour) |
 
@@ -164,7 +164,7 @@ These query the pre-built database of 3,600+ bounty-awarded public disclosures (
 |------|-------------|
 | `fetch_rewarded_reports` | Sync your bounty-awarded reports from the API |
 | `fetch_program_reports(handle, out_dir?, include_internal?)` | Sync **all** your reports for a program — every state, not just rewarded — each with its full comment/activity timeline. Optionally export one markdown file per report (plus `raw/<id>.json` and `index.md`) to `out_dir`. |
-| `fetch_programs` | Sync your accessible programs |
+| `fetch_programs` | Sync your accessible programs, public and private (private = invite-only / `soft_launched`). Re-run once after upgrading to populate the public/private flag. |
 | `fetch_program_scopes(handle)` | Sync scopes for a program (called automatically by `hack()`) |
 
 ## Architecture
